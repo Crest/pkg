@@ -263,9 +263,10 @@ pkgprotocol_open(struct pkg_repo *repo, struct fetch_item *fi,
 {
 	char *line = NULL;
 	size_t linecap = 0;
-	size_t linelen;
+	ssize_t linelen;
 	const char *errstr;
 	int retcode = EPKG_FATAL;
+	bool reused;
 	struct yuarel url;
 	char *url_to_free = xstrdup(fi->url);
 
@@ -276,40 +277,51 @@ pkgprotocol_open(struct pkg_repo *repo, struct fetch_item *fi,
 	}
 
 	pkg_dbg(PKG_DBG_FETCH, 1, "SSH> tcp_open");
-	if (repo->fh == NULL)
+again:
+	reused = (repo->fh != NULL);
+	if (!reused) {
 		retcode = proto_connect(repo, &url);
-	else
-		retcode = EPKG_OK;
-
-	if (retcode != EPKG_OK)
-		return (retcode);
+		if (retcode != EPKG_OK)
+			goto out;
+	}
+	retcode = EPKG_FATAL;
 
 	pkg_dbg(PKG_DBG_FETCH, 1, "SSH> get %s %" PRIdMAX "", url.path, (intmax_t)fi->mtime);
 	fprintf(repo->fh, "get %s %" PRIdMAX "\n", url.path, (intmax_t)fi->mtime);
-	if ((linelen = getline(&line, &linecap, repo->fh)) > 0) {
-		if (line[linelen -1 ] == '\n')
-			line[linelen -1 ] = '\0';
-
-		pkg_dbg(PKG_DBG_FETCH, 1, "SSH> recv: %s", line);
-		if (strncmp(line, "ok:", 3) == 0) {
-			fi->size = strtonum(line + 4, 0, LONG_MAX, &errstr);
-			if (errstr) {
-				goto out;
-			}
-
-			if (fi->size == 0) {
-				retcode = EPKG_UPTODATE;
-				goto out;
-			}
-
-			retcode = EPKG_OK;
-			goto out;
+	if ((linelen = getline(&line, &linecap, repo->fh)) <= 0) {
+		/*
+		 * No answer: the server closed the session, for example
+		 * while pkg was waiting at a prompt. Drop the session; if
+		 * it was one kept from an earlier fetch, connect again once.
+		 */
+		fclose(repo->fh);
+		repo->fh = NULL;
+		if (reused) {
+			pkg_dbg(PKG_DBG_FETCH, 1, "SSH> session closed by the server, reconnecting");
+			goto again;
 		}
-		if (strncmp(line, "ko:", 3) == 0) {
-			retcode = EPKG_FATAL;
-			goto out;
-		}
+		pkg_emit_error("%s: connection closed by the server", fi->url);
+		goto out;
 	}
+	if (line[linelen - 1] == '\n')
+		line[linelen - 1] = '\0';
+
+	pkg_dbg(PKG_DBG_FETCH, 1, "SSH> recv: %s", line);
+	if (strncmp(line, "ok:", 3) == 0) {
+		fi->size = strtonum(line + 4, 0, LONG_MAX, &errstr);
+		if (errstr) {
+			goto out;
+		}
+
+		if (fi->size == 0) {
+			retcode = EPKG_UPTODATE;
+			goto out;
+		}
+
+		retcode = EPKG_OK;
+		goto out;
+	}
+	/* "ko: <reason>", or anything else: the fetch failed */
 
 out:
 	free(url_to_free);
